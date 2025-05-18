@@ -15,6 +15,7 @@
 #include <cmath>
 #include <qmath.h>
 #include <QPointF>
+
 enum BrushType {
     Brush_Smear,
     Brush_Grow,
@@ -112,9 +113,26 @@ public:
                         case Brush_Smear:
                             offset = direction * (force / radius) * smoothed;
                             break;
-                        case Brush_Ungoo:
-                            offset = -direction * (force / radius) * smoothed;
-                            break;
+                    case Brush_Ungoo: {
+                        QColor originalColor = sampleBilinear(originalImage, coord.x(), coord.y());
+                        QColor currentColor = newImage.pixelColor(x, y);
+
+                        float blend = smoothed * (force / 50.0f);  // how much to restore
+                        blend = qBound(0.0f, blend, 1.0f);         // clamp blend factor
+
+                        auto clampF = [](float v) { return qBound(0.0f, v, 1.0f); };
+
+                        QColor blended = QColor::fromRgbF(
+                            clampF(currentColor.redF()   * (1 - blend) + originalColor.redF()   * blend),
+                            clampF(currentColor.greenF() * (1 - blend) + originalColor.greenF() * blend),
+                            clampF(currentColor.blueF()  * (1 - blend) + originalColor.blueF()  * blend),
+                            clampF(currentColor.alphaF() * (1 - blend) + originalColor.alphaF() * blend)
+                        );
+
+                        newImage.setPixelColor(x, y, blended);
+                        continue;
+                    }
+
                         case Brush_Grow:
                             offset = QVector2D(coord - location).normalized().toPointF()
  * (force / radius) * smoothed;
