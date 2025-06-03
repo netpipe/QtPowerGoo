@@ -19,12 +19,20 @@ enum ToolMode {
     Tool_PaintA,
     Tool_PaintB,
     Tool_Smear,
-    Tool_Smooth
+    Tool_Smooth,
+    Tool_MoveA,
+    Tool_MoveB
 };
+QPoint dragStart;
+QPoint originalOffset;
+
 
 class FusionCanvas : public QWidget {
     QImage imgA, imgB, mask, fusion;
     float radius = 50.0f;
+    QPoint offsetA = QPoint(0, 0);
+    QPoint offsetB = QPoint(0, 0);
+
     ToolMode mode = Tool_PaintA;
 
 public:
@@ -48,22 +56,44 @@ public:
 
     void updateFusion() {
         fusion = QImage(imgA.size(), QImage::Format_ARGB32);
+
         for (int y = 0; y < fusion.height(); ++y) {
             for (int x = 0; x < fusion.width(); ++x) {
+                // Map (x, y) to source positions in A and B
+                QPoint pt(x, y);
+                QPoint ptA = pt - offsetA;
+                QPoint ptB = pt - offsetB;
+
+                QColor cA = Qt::black;
+                QColor cB = Qt::black;
+
+                // Sample A if inside bounds
+                if (imgA.rect().contains(ptA)) {
+                    cA = imgA.pixelColor(ptA);
+                }
+
+                // Sample B if inside bounds
+                if (imgB.rect().contains(ptB)) {
+                    cB = imgB.pixelColor(ptB);
+                }
+
+                // Mask always aligns with fusion
                 int alpha = mask.pixelColor(x, y).red(); // 0–255
                 float blend = alpha / 255.0f;
-                QColor cA = imgA.pixelColor(x, y);
-                QColor cB = imgB.pixelColor(x, y);
+
                 QColor mix = QColor::fromRgb(
                     cA.red()   * (1 - blend) + cB.red()   * blend,
                     cA.green() * (1 - blend) + cB.green() * blend,
                     cA.blue()  * (1 - blend) + cB.blue()  * blend
                 );
+
                 fusion.setPixelColor(x, y, mix);
             }
         }
-        update();
+
+        update(); // trigger repaint
     }
+
 
     void paintEvent(QPaintEvent*) override {
         QPainter p(this);
@@ -71,6 +101,17 @@ public:
     }
 QPoint lastPos;
     void mouseMoveEvent(QMouseEvent *e) override {
+        if ((mode == Tool_MoveA || mode == Tool_MoveB) && (e->buttons() & Qt::LeftButton)) {
+            QPoint delta = e->pos() - dragStart;
+            if (mode == Tool_MoveA)
+                offsetA = originalOffset + delta;
+            else
+                offsetB = originalOffset + delta;
+
+            updateFusion(); // reblend with new offset
+            update();       // redraw
+        }
+
         if (mode == Tool_Smear && (e->buttons() & Qt::LeftButton)) {
             QPointF delta = e->pos() - lastPos;
             if (delta.manhattanLength() < 1)
@@ -100,6 +141,11 @@ applyBrush(e->pos());
     }
 
     void mousePressEvent(QMouseEvent *e) override {
+        if (mode == Tool_MoveA || mode == Tool_MoveB) {
+            dragStart = e->pos();
+            originalOffset = (mode == Tool_MoveA) ? offsetA : offsetB;
+        }
+
         applyBrush(e->pos());
     }
 
@@ -204,11 +250,15 @@ int main(int argc, char *argv[]) {
     QRadioButton *paintB = new QRadioButton("Paint B");
     QRadioButton *smear = new QRadioButton("Smear");
     QRadioButton *smooth = new QRadioButton("Smooth");
+    QRadioButton *movea = new QRadioButton("Move A");
+    QRadioButton *moveb = new QRadioButton("Move B");
     paintA->setChecked(true);
     tools->addButton(paintA, Tool_PaintA);
     tools->addButton(paintB, Tool_PaintB);
     tools->addButton(smear, Tool_Smear);
     tools->addButton(smooth, Tool_Smooth);
+    tools->addButton(movea, Tool_MoveA);
+    tools->addButton(moveb, Tool_MoveB);
 
     QObject::connect(tools, QOverload<int>::of(&QButtonGroup::buttonClicked), [=](int id) {
         canvas->setTool(static_cast<ToolMode>(id));
@@ -231,6 +281,8 @@ int main(int argc, char *argv[]) {
     controls->addWidget(paintB);
     controls->addWidget(smear);
     controls->addWidget(smooth);
+    controls->addWidget(movea);
+    controls->addWidget(moveb);
     controls->addWidget(new QLabel("Brush Radius"));
     controls->addWidget(radiusSlider);
     controls->addWidget(flipA);
