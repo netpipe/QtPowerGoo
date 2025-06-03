@@ -132,8 +132,12 @@ int main(int argc, char *argv[]) {
     buttons->addWidget(startBtn); buttons->addWidget(stopBtn);
     mainLayout->addLayout(buttons);
 
-    QImage imgA = loadAndResize("imgA.png");
-    QImage imgB = loadAndResize("imgB.png");
+    QString pathA = QFileDialog::getOpenFileName(nullptr, "Select Face A");
+    QString pathB = QFileDialog::getOpenFileName(nullptr, "Select Face B");
+    if (pathA.isEmpty() || pathB.isEmpty()) return 0;
+
+    QImage imgA = loadAndResize(pathA);
+    QImage imgB = loadAndResize(pathB);
     QTimer* timer = new QTimer;
     int time = 0;
 
@@ -144,10 +148,10 @@ int main(int argc, char *argv[]) {
         float warp = warpSlider->value();
 
         QImage fused = blendFusion(imgA, imgB, blend, warp, time);
-        QImage fractal = generateFractal(zoom, time);
+      //  QImage fractal = generateFractal(zoom, time);
         QImage combo(canvasSize, QImage::Format_RGB32);
         QPainter p(&combo);
-        p.drawImage(0, 0, fractal);
+       // p.drawImage(0, 0, fractal);
         p.setOpacity(0.7);
         p.drawImage(0, 0, applyTileSpin(fused, spin + time, 4));
         p.end();
