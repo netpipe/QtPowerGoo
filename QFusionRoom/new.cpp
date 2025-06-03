@@ -1,0 +1,422 @@
+#include <QApplication>
+#include <QWidget>
+#include <QImage>
+#include <QPainter>
+#include <QVBoxLayout>
+#include <QHBoxLayout>
+#include <QPushButton>
+#include <QMouseEvent>
+#include <QFileDialog>
+#include <QSlider>
+#include <QLabel>
+#include <QRadioButton>
+#include <QButtonGroup>
+#include <QGroupBox>
+#include <QTransform>
+#include <QObject>
+#include <qdebug.h>
+
+enum ToolMode {
+    Tool_PaintA,
+    Tool_PaintB,
+    Tool_PaintFromA,
+    Tool_PaintFromB,
+    Tool_Smear,
+    Tool_Smooth,
+    Tool_MoveA,
+    Tool_MoveB
+};
+QPoint dragStart;
+QPoint originalOffset;
+QPoint paintSource;
+bool paintSourceSet = false;
+
+enum PaintSourceImage { SourceA, SourceB };
+PaintSourceImage paintSourceImage;
+
+
+
+// ImageView.h
+class ImageView : public QLabel {
+    Q_OBJECT
+public:
+    enum ImageSource { SourceA, SourceB };
+
+    ImageView(ImageSource source, QWidget* parent = nullptr)
+        : QLabel(parent), src(source) {}
+
+signals:
+    void sourcePointPicked(QPoint imagePos, ImageSource source);
+
+protected:
+    void mousePressEvent(QMouseEvent* event) override {
+        if (QApplication::keyboardModifiers() & Qt::AltModifier) {
+            QPoint pos = event->pos();
+            emit sourcePointPicked(pos, src);
+        }
+    }
+
+private:
+    ImageSource src;
+};
+
+
+
+class FusionCanvas : public QWidget {
+    QImage imgA, imgB, mask, fusion;
+    float radius = 50.0f;
+    QPoint offsetA = QPoint(0, 0);
+    QPoint offsetB = QPoint(0, 0);
+    ToolMode mode = Tool_PaintA;
+
+public:
+    FusionCanvas(const QString &pathA, const QString &pathB, QWidget *parent = nullptr) : QWidget(parent) {
+        imgA.load(pathA);
+        imgB.load(pathB);
+        imgA = imgA.convertToFormat(QImage::Format_ARGB32);
+        imgB = imgB.convertToFormat(QImage::Format_ARGB32);
+        imgA = imgA.scaled(400, 400, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+        imgB = imgB.scaled(imgA.size(), Qt::KeepAspectRatio, Qt::SmoothTransformation);
+
+        setFixedSize(imgA.size());
+        mask = QImage(imgA.size(), QImage::Format_Grayscale8);
+        mask.fill(128); // 128 = even mix of A and B
+
+        updateFusion();
+    }
+
+    void setRadius(int r) { radius = r; }
+    void setTool(ToolMode m) { mode = m; }
+
+    void updateFusion() {
+        fusion = QImage(imgA.size(), QImage::Format_ARGB32);
+
+        for (int y = 0; y < fusion.height(); ++y) {
+            for (int x = 0; x < fusion.width(); ++x) {
+                // Map (x, y) to source positions in A and B
+                QPoint pt(x, y);
+                QPoint ptA = pt - offsetA;
+                QPoint ptB = pt - offsetB;
+
+                QColor cA = Qt::black;
+                QColor cB = Qt::black;
+
+                // Sample A if inside bounds
+                if (imgA.rect().contains(ptA)) {
+                    cA = imgA.pixelColor(ptA);
+                }
+
+                // Sample B if inside bounds
+                if (imgB.rect().contains(ptB)) {
+                    cB = imgB.pixelColor(ptB);
+                }
+
+                // Mask always aligns with fusion
+                int alpha = mask.pixelColor(x, y).red(); // 0–255
+                float blend = alpha / 255.0f;
+
+                QColor mix = QColor::fromRgb(
+                    cA.red()   * (1 - blend) + cB.red()   * blend,
+                    cA.green() * (1 - blend) + cB.green() * blend,
+                    cA.blue()  * (1 - blend) + cB.blue()  * blend
+                );
+
+                fusion.setPixelColor(x, y, mix);
+            }
+        }
+
+        update(); // trigger repaint
+    }
+
+
+    void paintEvent(QPaintEvent*) override {
+        QPainter p(this);
+        p.drawImage(0, 0, fusion);
+    }
+
+QPoint lastPos;
+    void mouseMoveEvent(QMouseEvent *e) override {
+
+        if ((e->buttons() & Qt::LeftButton) &&
+            (mode == Tool_PaintFromA || mode == Tool_PaintFromB) &&
+            paintSourceSet) {
+            paintFromSource(e->pos());
+        }
+
+
+        if ((mode == Tool_MoveA || mode == Tool_MoveB) && (e->buttons() & Qt::LeftButton)) {
+            QPoint delta = e->pos() - dragStart;
+            if (mode == Tool_MoveA)
+                offsetA = originalOffset + delta;
+            else
+                offsetB = originalOffset + delta;
+
+            updateFusion(); // reblend with new offset
+            update();       // redraw
+        }
+
+        if (mode == Tool_Smear && (e->buttons() & Qt::LeftButton)) {
+            QPointF delta = e->pos() - lastPos;
+            if (delta.manhattanLength() < 1)
+                return;
+
+            QPainter p(&mask);
+            p.setRenderHint(QPainter::SmoothPixmapTransform);
+            p.setRenderHint(QPainter::Antialiasing);
+
+            int patchSize = radius * 2;
+            QRect area(lastPos - QPoint(radius, radius), QSize(patchSize, patchSize));
+            QImage patch = mask.copy(area);
+
+            QPointF offset = delta; // smear direction
+            QRectF targetRect = QRectF(area).translated(offset.x(), offset.y());
+
+
+            // Use semi-transparent blending to create a dragging effect
+            p.setOpacity(0.9); // blend rather than hard overwrite
+            p.drawImage(targetRect, patch);
+
+            updateFusion();
+            lastPos = e->pos();
+        }
+applyBrush(e->pos());
+
+    }
+
+    void paintFromSource(QPoint currentPos) {
+        if (!paintSourceSet) return;
+
+        int radius = 10;//brushRadius;
+        QPoint delta = currentPos - paintSource;
+
+        for (int dy = -radius; dy <= radius; ++dy) {
+            for (int dx = -radius; dx <= radius; ++dx) {
+                QPoint offset(dx, dy);
+                float dist = std::sqrt(dx*dx + dy*dy);
+                if (dist > radius) continue;
+
+                QPoint src = paintSource + offset;
+                QPoint dst = currentPos + offset;
+
+                if (!mask.rect().contains(dst)) continue;
+
+                // Sampling image pixel from src — optional for smarter tools later
+                // QColor fromImg = (mode == Tool_PaintFromA) ? imgA.pixelColor(src) : imgB.pixelColor(src);
+
+                float feather = 1.0f - (dist / radius);
+                feather *= feather; // feathering curve
+
+                float existing = mask.pixelColor(dst).redF();
+                float target = (mode == Tool_PaintFromA) ? 0.0f : 1.0f;
+                float blended = (1.0f - feather) * existing + feather * target;
+
+                blended = std::clamp(blended, 0.0f, 1.0f);
+                mask.setPixelColor(dst, QColor::fromRgbF(blended, blended, blended));
+            }
+        }
+
+        updateFusion();
+    }
+
+    void mousePressEvent(QMouseEvent *event) override {
+        QPoint click = event->pos();
+
+        QPoint imgAPos(0, 0);                      // top-left of imgA
+        QPoint imgBPos(imgA.width() + 10, 0);      // draw imgB with spacing
+        QPoint fusionPos(0, imgA.height() + 10);   // fusion drawn below them
+
+            QRect imgARect(imgAPos, imgA.size());
+            QRect imgBRect(imgBPos, imgB.size());
+
+            if (imgARect.contains(click)) {
+                paintSource = click - imgAPos;
+                paintSourceImage = SourceA;
+                paintSourceSet = true;
+                qDebug() << "Picked source from imgA at:" << paintSource;
+            } else if (imgBRect.contains(click)) {
+                paintSource = click - imgBPos;
+                paintSourceImage = SourceB;
+                paintSourceSet = true;
+                qDebug() << "Picked source from imgB at:" << paintSource;
+            } else {
+                qDebug() << "Clicked outside source images";
+            }
+
+
+
+        if (event->button() == Qt::LeftButton && paintSourceSet) {
+            lastPos = event->pos();
+            paintFromSource(lastPos);
+        }
+    }
+
+
+
+    void applyBrush(QPoint pos) {
+        if (mode == Tool_Smooth) {
+            int size = radius * 2;
+            QRect area(pos - QPoint(radius, radius), QSize(size, size));
+
+            QImage patch = mask.copy(area);
+            QImage blurred = patch.scaled(radius, radius, Qt::IgnoreAspectRatio, Qt::SmoothTransformation)
+                                  .scaled(size, size, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+
+            QPainter p(&mask);
+            p.setOpacity(0.7); // soft blend
+            p.drawImage(area.topLeft(), blurred);
+            updateFusion();
+            return;
+        }
+
+
+        QPainter p(&mask);
+
+        QRadialGradient g(pos, radius);
+        QColor existing = mask.pixelColor(pos);
+
+        if (mode == Tool_PaintA) {
+            g.setColorAt(0.0, QColor(0, 0, 0));
+        } else if (mode == Tool_PaintB) {
+            g.setColorAt(0.0, QColor(255, 255, 255));
+        } else {
+            return;
+        }
+        g.setColorAt(1.0, existing);  // feather from existing value
+
+        p.setCompositionMode(QPainter::CompositionMode_SourceOver);
+        p.setBrush(g);
+        p.setPen(Qt::NoPen);
+      //  p.drawEllipse(pos, radius, radius);
+        p.drawEllipse(QPointF(pos), radius, radius);
+
+        updateFusion();
+    }
+
+    void flipImageA(bool horiz) {
+        QTransform t;
+        t.scale(horiz ? -1 : 1, horiz ? 1 : -1);
+        imgA = imgA.transformed(t, Qt::SmoothTransformation);
+        updateFusion();
+    }
+
+    void flipImageB(bool horiz) {
+        QTransform t;
+        t.scale(horiz ? -1 : 1, horiz ? 1 : -1);
+        imgB = imgB.transformed(t, Qt::SmoothTransformation);
+        updateFusion();
+    }
+
+    // Canvas.h
+    public slots:
+        void setPaintSource(QPoint imagePos, ImageView::ImageSource src) {
+            paintSource = imagePos;
+            paintSourceImage = (src == ImageView::SourceA) ? SourceA : SourceB;
+            paintSourceSet = true;
+            qDebug() << "Source set from view:" << src << "at" << imagePos;
+        }
+
+
+    QImage getImageA() const { return imgA; }
+    QImage getImageB() const { return imgB; }
+    QImage getFusion() const { return fusion; }
+};
+
+int main(int argc, char *argv[]) {
+    QApplication app(argc, argv);
+
+    QString pathA = QFileDialog::getOpenFileName(nullptr, "Select Face A");
+    QString pathB = QFileDialog::getOpenFileName(nullptr, "Select Face B");
+    if (pathA.isEmpty() || pathB.isEmpty()) return 0;
+
+    QWidget *window = new QWidget;
+    QVBoxLayout *mainLayout = new QVBoxLayout(window);
+    QHBoxLayout *topLayout = new QHBoxLayout;
+    QHBoxLayout *controls = new QHBoxLayout;
+
+    // Load fusion canvas
+    FusionCanvas *canvas = new FusionCanvas(pathA, pathB);
+
+    // Views for A, Fusion, B
+    ImageView* viewA = new ImageView(ImageView::SourceA);
+    ImageView* viewB = new ImageView(ImageView::SourceB);
+//QLabel *viewA = new QLabel;
+//QLabel *viewB = new QLabel;
+    QLabel *viewF = new QLabel;
+
+    viewA->setPixmap(QPixmap::fromImage(canvas->getImageA()));
+    viewB->setPixmap(QPixmap::fromImage(canvas->getImageB()));
+    viewF->setPixmap(QPixmap::fromImage(canvas->getFusion()));
+
+    viewF->setPixmap(QPixmap::fromImage(canvas->getFusion()));
+
+    topLayout->addWidget(viewA);
+    topLayout->addWidget(canvas);
+    topLayout->addWidget(viewB);
+
+    // Brush radius slider
+    QSlider *radiusSlider = new QSlider(Qt::Horizontal);
+    radiusSlider->setRange(10, 100);
+    radiusSlider->setValue(50);
+    QObject::connect(radiusSlider, &QSlider::valueChanged, canvas, &FusionCanvas::setRadius);
+
+    // Tool selection
+    QButtonGroup *tools = new QButtonGroup;
+    QRadioButton *paintA = new QRadioButton("Paint A");
+    QRadioButton *paintB = new QRadioButton("Paint B");
+    QRadioButton *smear = new QRadioButton("Smear");
+    QRadioButton *smooth = new QRadioButton("Smooth");
+    QRadioButton *movea = new QRadioButton("Move A");
+    QRadioButton *moveb = new QRadioButton("Move B");
+    QRadioButton *paintfa = new QRadioButton("Paintf A");
+    QRadioButton *paintfb = new QRadioButton("Paintf B");
+    paintA->setChecked(true);
+    tools->addButton(paintA, Tool_PaintA);
+    tools->addButton(paintB, Tool_PaintB);
+    tools->addButton(smear, Tool_Smear);
+    tools->addButton(smooth, Tool_Smooth);
+    tools->addButton(movea, Tool_MoveA);
+    tools->addButton(moveb, Tool_MoveB);
+    tools->addButton(paintfa, Tool_PaintFromA);
+    tools->addButton(paintfb, Tool_PaintFromB);
+
+    QObject::connect(viewA, &ImageView::sourcePointPicked, canvas, &FusionCanvas::setPaintSource);
+    QObject::connect(viewB, &ImageView::sourcePointPicked, canvas, &FusionCanvas::setPaintSource);
+
+    QObject::connect(tools, QOverload<int>::of(&QButtonGroup::buttonClicked), [=](int id) {
+        canvas->setTool(static_cast<ToolMode>(id));
+    });
+
+    // Flip buttons
+    QPushButton *flipA = new QPushButton("Flip A");
+    QPushButton *flipB = new QPushButton("Flip B");
+
+    QObject::connect(flipA, &QPushButton::clicked, [=]() {
+        canvas->flipImageA(true);
+        viewA->setPixmap(QPixmap::fromImage(canvas->getImageA()));
+    });
+    QObject::connect(flipB, &QPushButton::clicked, [=]() {
+        canvas->flipImageB(true);
+        viewB->setPixmap(QPixmap::fromImage(canvas->getImageB()));
+    });
+
+    controls->addWidget(paintA);
+    controls->addWidget(paintB);
+    controls->addWidget(paintfa);
+    controls->addWidget(paintfb);
+    controls->addWidget(smear);
+    controls->addWidget(smooth);
+    controls->addWidget(movea);
+    controls->addWidget(moveb);
+    controls->addWidget(new QLabel("Brush Radius"));
+    controls->addWidget(radiusSlider);
+    controls->addWidget(flipA);
+    controls->addWidget(flipB);
+
+    mainLayout->addLayout(topLayout);
+    mainLayout->addLayout(controls);
+    window->setLayout(mainLayout);
+    window->setWindowTitle("Kai's Fusion Room Clone");
+    window->show();
+
+    return app.exec();
+}
